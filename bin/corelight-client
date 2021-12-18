@@ -7,9 +7,22 @@
 import json
 import os
 import os.path
+import platform
 import sys
 import re
 import urllib.parse
+
+try:
+    from opentelemetry import trace
+    from opentelemetry.trace.status import Status, StatusCode
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.resources import Resource
+except ModuleNotFoundError:
+    # If OpenTelemetry isn't installed, we'll silently go without
+    pass
+
+    # But we'll set trace to help later
+    trace = None
 
 import client.argparser
 import client.configuration
@@ -17,6 +30,17 @@ import client.meta
 import client.resource
 import client.session
 import client.util
+
+if trace:
+    tracer = trace.get_tracer(__name__)
+else:
+    import contextlib
+
+    class TraceUtil:
+        def start_as_current_span(self, *args, **kwargs):
+            return contextlib.suppress()
+
+    tracer = TraceUtil()
 
 # URL to connect to.
 SensorBaseURL = "{scheme}://{netloc}/api/"
@@ -237,139 +261,187 @@ else:
 new_credential_argv = []
 auth_method_used = AUTH_TYPE_NONE
 
-for i in range(len(auth_schemes_to_use)):
-    auth_method_used = auth_schemes_to_use[i]
-    has_next_auth_scheme = ((i + 1) < len(auth_schemes_to_use))
-    try:
-        msg = "Trying next authentication method ({})".format(auth_method_used)
+if trace and trace._TRACER_PROVIDER is None:
+    # pylint: disable=ungrouped-imports
+    from opentelemetry.semconv.resource import ResourceAttributes
 
-        if i == 0:
-            client.util.debug(msg)
-        else:
-            client.util.infoMessage(msg)
+    trace.set_tracer_provider(
+        TracerProvider(
+            resource=Resource.create({
+                ResourceAttributes.SERVICE_NAME: "corelight-client",
+                ResourceAttributes.HOST_NAME: platform.node(),
+                ResourceAttributes.PROCESS_COMMAND: os.path.basename(sys.argv[0]),
+                ResourceAttributes.PROCESS_PID: str(os.getpid()),
+            }),
+        ),
+    )
 
-        # If we are in password interactive mode, we need to
-        # prompt the user now.
-        if AUTH_TYPE_PASSWORD_INTERACTIVE == auth_method_used:
-            args.bearer_token = None
-            if not password_is_explicit:
-                args.password = None
+if trace and "OTEL_CONSOLE_SPAN_EXPORT" in os.environ:
+    # pylint: disable=ungrouped-imports
+    from opentelemetry.sdk.trace.export import (
+        BatchSpanProcessor,
+        ConsoleSpanExporter,
+    )
 
-            if not username_is_explicit:
-                args.user = None
+    provider = trace.get_tracer_provider()
+    processor = BatchSpanProcessor(ConsoleSpanExporter())
+    provider.add_span_processor(processor)
 
-            new_credential_argv = client.util.promptUserCredentials(args)
-        elif AUTH_TYPE_PASSWORD == auth_method_used:
-            args.bearer_token = None
-            new_credential_argv = ["--user", args.user, "--password", args.password]
-        elif AUTH_TYPE_NONE == auth_method_used:
-            args.bearer_token = None
-            args.user = None
-            args.password = None
+with tracer.start_as_current_span(name="root span"):
+    with tracer.start_as_current_span(name="find auth method"):
+        for i in range(len(auth_schemes_to_use)):
+            auth_method_used = auth_schemes_to_use[i]
+            with tracer.start_as_current_span(name="test auth method", attributes={"auth.method": auth_method_used}):
+                has_next_auth_scheme = ((i + 1) < len(auth_schemes_to_use))
+                try:
+                    msg = "Trying next authentication method ({})".format(auth_method_used)
 
-        # Fetch the metadata
-        meta = client.meta.load(session, url, cache_file=cache)
+                    if i == 0:
+                        client.util.debug(msg)
+                    else:
+                        client.util.infoMessage(msg)
 
-        # If we use password auth, we may have retrieved a new bearer token.
-        if AUTH_TYPE_PASSWORD == auth_method_used or AUTH_TYPE_PASSWORD_INTERACTIVE == auth_method_used:
+                    # If we are in password interactive mode, we need to
+                    # prompt the user now.
+                    if AUTH_TYPE_PASSWORD_INTERACTIVE == auth_method_used:
+                        args.bearer_token = None
+                        if not password_is_explicit:
+                            args.password = None
+
+                        if not username_is_explicit:
+                            args.user = None
+
+                        new_credential_argv = client.util.promptUserCredentials(args)
+                    elif AUTH_TYPE_PASSWORD == auth_method_used:
+                        args.bearer_token = None
+                        new_credential_argv = ["--user", args.user, "--password", args.password]
+                    elif AUTH_TYPE_NONE == auth_method_used:
+                        args.bearer_token = None
+                        args.user = None
+                        args.password = None
+
+                    with tracer.start_as_current_span(name="fetch metadata"):
+                        # Fetch the metadata
+                        meta = client.meta.load(session, url, cache_file=cache)
+
+                    # If we use password auth, we may have retrieved a new bearer token.
+                    if AUTH_TYPE_PASSWORD == auth_method_used or AUTH_TYPE_PASSWORD_INTERACTIVE == auth_method_used:
+                        if args.bearer_token:
+                            new_credential_argv = new_credential_argv + [ "--bearer", args.bearer_token ]
+
+                    # We succeeded at getting metadata. Save what we have to
+                    msg = "Authentication succeeded ({})".format(auth_method_used)
+                    if i == 0:
+                        client.util.debug(msg)
+                    else:
+                        client.util.infoMessage(msg)
+
+                    if trace:
+                        trace.get_current_span().set_status(Status(StatusCode.OK))
+
+                    break
+
+                except client.session.SessionError as e:
+                    if trace:
+                        trace.get_current_span().set_status(Status(StatusCode.ERROR, str(e)))
+
+                    if e.status_code == 401:
+                        client.util.error("Authentication method failed", auth_method_used)
+
+                    if e.status_code == 401 and has_next_auth_scheme:
+                        # Clear out the invalid credentials for the next iteration
+                        if AUTH_TYPE_BEARER_TOKEN == auth_method_used:
+                            args.bearer_token = None
+                        elif AUTH_TYPE_PASSWORD == auth_method_used or AUTH_TYPE_PASSWORD_INTERACTIVE == auth_method_used:
+                            new_credential_argv = []
+                            if not username_is_explicit:
+                                args.user = None
+                            if not password_is_explicit:
+                                args.password = None
+                    else:
+                        e.fatalError()
+
+            # just before we exit "test auth method"
+            # if we fallthrough to here, an auth method *wasn't* found
+            if trace:
+                trace.get_current_span().set_status(Status(StatusCode.ERROR))
+
+        # just before we exit "find auth method"
+        # if we fallthrough to here (instead of exiting Python), I think one was found.
+        if trace:
+            trace.get_current_span().set_status(Status(StatusCode.OK))
+
+    if not meta.from_cache:
+        with tracer.start_as_current_span(name="save metadata in cache"):
+            meta.save(cache)
+
+    if len(new_credential_argv) > 0:
+        argv_pass2 = new_credential_argv + argv_pass2
+    elif len(cached_credential_argv) > 0:
+        argv_pass2 = cached_credential_argv + argv_pass2
+
+    # Access worked, offer to save crendentials if entered interactively.
+    used_password_authentication =  (auth_method_used == AUTH_TYPE_PASSWORD_INTERACTIVE or auth_method_used == AUTH_TYPE_PASSWORD)
+
+    if not args.no_password_save:
+        save_credentials = False
+        include_password = False
+        # We can update the bearer token automatically if all of the following are true:
+        #  * We previously had a bearer token cached.
+        #  * We have a bearer token now.
+        #  * The cached bearer token does not match our current one (e.g. we have a new one).
+        #  * We used password authentication to get the new bearer token.
+        #  * The previous bearer token was cached for the same user as the new one.
+        automatically_cache_bearer_token = cached_creds[client.configuration.CRED_BEARER_OFFSET]
+        automatically_cache_bearer_token = (automatically_cache_bearer_token and args.bearer_token)
+        automatically_cache_bearer_token = (automatically_cache_bearer_token and cached_creds[client.configuration.CRED_BEARER_OFFSET] != args.bearer_token)
+        automatically_cache_bearer_token = (automatically_cache_bearer_token and used_password_authentication)
+        automatically_cache_bearer_token = (automatically_cache_bearer_token and args.user == cached_creds[client.configuration.CRED_USER_OFFSET])
+
+        if automatically_cache_bearer_token:
+            # Just update the bearer token and tell the user to expect this.
+            save_credentials = True
+            include_password = (cached_creds[client.configuration.CRED_USER_OFFSET] and cached_creds[client.configuration.CRED_PASS_OFFSET])
+            if include_password and cached_creds[client.configuration.CRED_PASS_OFFSET] != args.password:
+                print("Updating authenticated session and plain text password in '{}'".format(CredentialsFile), file=sys.stderr)
+            else:
+                print("Updating authenticated session in '{}'".format(CredentialsFile), file=sys.stderr)
+
+        elif auth_method_used == AUTH_TYPE_PASSWORD_INTERACTIVE and not args.noblock:
             if args.bearer_token:
-                new_credential_argv = new_credential_argv + [ "--bearer", args.bearer_token ]
+                # We have an authenticated session. Try to get the user to not save their password.
+                save_credentials = (client.util.getInput("Cache authenticated session? Please note that your session token will be saved in plain text under '{}'. (yes/no)".format(CredentialsFile)) == "yes")
+                include_password = save_credentials and (client.util.getInput("Include password in plain text? After expiry, your authenticated session will have to be refreshed. (yes/no)") == "yes")
+            else:
+                # For systems (e.g. sensors) where we only have a password we will only ask one question.
+                save_credentials = (client.util.getInput("Save credentials? Please note that your username and password will be saved in plain text under '{}'. (yes/no)".format(CredentialsFile)) == "yes")
+                include_password = save_credentials
 
-        # We succeeded at getting metadata. Save what we have to
-        msg = "Authentication succeeded ({})".format(auth_method_used)
-        if i == 0:
-            client.util.debug(msg)
-        else:
-            client.util.infoMessage(msg)
+        if save_credentials:
+            client.configuration.saveCredentials(CredentialsFile, args, credentials_id, include_password)
 
-        break
+    # Now extend the argument parser with all the meta information.
 
-    except client.session.SessionError as e:
-        if e.status_code == 401:
-            client.util.error("Authentication method failed", auth_method_used)
+    client.argparser.populateParser(parser, meta, limit_components_to=remaining)
 
-        if e.status_code == 401 and has_next_auth_scheme:
-            # Clear out the invalid credentials for the next iteration
-            if AUTH_TYPE_BEARER_TOKEN == auth_method_used:
-                args.bearer_token = None
-            elif AUTH_TYPE_PASSWORD == auth_method_used or AUTH_TYPE_PASSWORD_INTERACTIVE == auth_method_used:
-                new_credential_argv = []
-                if not username_is_explicit:
-                    args.user = None
-                if not password_is_explicit:
-                    args.password = None
-        else:
-            e.fatalError()
+    # Reparse command line arguments.
+    args = parser.parse_args(argv_pass2)
+    args.auth_base_url = fleet_auth_base_url
 
-if not meta.from_cache:
-    meta.save(cache)
+    session.setArguments(args)
 
-if len(new_credential_argv) > 0:
-    argv_pass2 = new_credential_argv + argv_pass2
-elif len(cached_credential_argv) > 0:
-    argv_pass2 = cached_credential_argv + argv_pass2
+    try:
+        # A "help" command.
+        help = args.parser_for_help
+        client.argparser.printHelp(None, help, args)
+    except AttributeError:
+        pass
 
-# Access worked, offer to save crendentials if entered interactively.
-used_password_authentication =  (auth_method_used == AUTH_TYPE_PASSWORD_INTERACTIVE or auth_method_used == AUTH_TYPE_PASSWORD)
+    try:
+        resource = args.resource
+    except AttributeError:
+        print("No command given. Use --help to see list.")
+        sys.exit(1)
 
-if not args.no_password_save:
-    save_credentials = False
-    include_password = False
-    # We can update the bearer token automatically if all of the following are true:
-    #  * We previously had a bearer token cached.
-    #  * We have a bearer token now.
-    #  * The cached bearer token does not match our current one (e.g. we have a new one).
-    #  * We used password authentication to get the new bearer token.
-    #  * The previous bearer token was cached for the same user as the new one.
-    automatically_cache_bearer_token = cached_creds[client.configuration.CRED_BEARER_OFFSET]
-    automatically_cache_bearer_token = (automatically_cache_bearer_token and args.bearer_token)
-    automatically_cache_bearer_token = (automatically_cache_bearer_token and cached_creds[client.configuration.CRED_BEARER_OFFSET] != args.bearer_token)
-    automatically_cache_bearer_token = (automatically_cache_bearer_token and used_password_authentication)
-    automatically_cache_bearer_token = (automatically_cache_bearer_token and args.user == cached_creds[client.configuration.CRED_USER_OFFSET])
-
-    if automatically_cache_bearer_token:
-        # Just update the bearer token and tell the user to expect this.
-        save_credentials = True
-        include_password = (cached_creds[client.configuration.CRED_USER_OFFSET] and cached_creds[client.configuration.CRED_PASS_OFFSET])
-        if include_password and cached_creds[client.configuration.CRED_PASS_OFFSET] != args.password:
-            print("Updating authenticated session and plain text password in '{}'".format(CredentialsFile), file=sys.stderr)
-        else:
-            print("Updating authenticated session in '{}'".format(CredentialsFile), file=sys.stderr)
-    
-    elif auth_method_used == AUTH_TYPE_PASSWORD_INTERACTIVE and not args.noblock:
-        if args.bearer_token:
-            # We have an authenticated session. Try to get the user to not save their password.
-            save_credentials = (client.util.getInput("Cache authenticated session? Please note that your session token will be saved in plain text under '{}'. (yes/no)".format(CredentialsFile)) == "yes")
-            include_password = save_credentials and (client.util.getInput("Include password in plain text? After expiry, your authenticated session will have to be refreshed. (yes/no)") == "yes")
-        else:
-            # For systems (e.g. sensors) where we only have a password we will only ask one question.
-            save_credentials = (client.util.getInput("Save credentials? Please note that your username and password will be saved in plain text under '{}'. (yes/no)".format(CredentialsFile)) == "yes")
-            include_password = save_credentials
-    
-    if save_credentials:
-        client.configuration.saveCredentials(CredentialsFile, args, credentials_id, include_password)
-
-# Now extend the argument parser with all the meta information.
-
-client.argparser.populateParser(parser, meta, limit_components_to=remaining)
-
-# Reparse command line arguments.
-args = parser.parse_args(argv_pass2)
-args.auth_base_url = fleet_auth_base_url
-
-session.setArguments(args)
-
-try:
-    # A "help" command.
-    help = args.parser_for_help
-    client.argparser.printHelp(None, help, args)
-except AttributeError:
-    pass
-
-try:
-    resource = args.resource
-except AttributeError:
-    print("No command given. Use --help to see list.")
-    sys.exit(1)
-
-client.resource.process(session, resource)
+    with tracer.start_as_current_span(name="process"):
+        client.resource.process(session, resource)

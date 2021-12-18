@@ -15,6 +15,15 @@ import requests.packages.urllib3
 import requests.packages.urllib3.poolmanager
 import requests.packages.urllib3.connection
 import requests.packages.urllib3.connectionpool
+
+try:
+    from opentelemetry.instrumentation.requests import RequestsInstrumentor
+
+    RequestsInstrumentor().instrument()
+except (ModuleNotFoundError, ImportError):
+    # If OpenTelemetry isn't installed, we'll silently go without
+    pass
+
 import client.util
 
 # The CA to validate default Corelight certificates with.
