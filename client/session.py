@@ -361,19 +361,23 @@ class Session:
         prepared = Session._RequestsSession.prepare_request(req)
 
         if client.util.debugLevel():
-            client.util.debug("== {} {}".format(prepared.method, prepared.url), level=debug_level)
+            msg = ""
+
+            msg += "== {} {}\n".format(prepared.method, prepared.url)
 
             for (k, v) in prepared.headers.items():
-                client.util.debug("| {}: {}".format(k, v), level=debug_level)
+                msg += "| {}: {}\n".format(k, v)
 
-            client.util.debug("| ", level=debug_level)
+            msg += "| \n"
 
             if prepared.body:
                 for line in prepared.body.splitlines():
                     if isinstance(line, bytes):
                         line = line.decode("utf8", "ignore")
 
-                    client.util.debug("| " + line, level=debug_level)
+                    msg += "| {}\n".format(line)
+
+            client.util.debug(msg, level=debug_level)
 
         try:
             response = Session._RequestsSession.send(prepared)
@@ -457,16 +461,20 @@ class Session:
             cert = None
 
         if client.util.debugLevel():
-            client.util.debug("== {} {}".format(response.status_code, response.reason), level=debug_level)
+            msg = ""
+
+            msg += "== {} {}\n".format(response.status_code, response.reason)
 
             for (k, v) in response.headers.items():
-                client.util.debug("| {}: {}".format(k, v), level=debug_level)
+                msg += "| {}: {}\n".format(k, v)
 
-            client.util.debug("| ", level=debug_level)
+            msg += "| \n"
 
             if response.content:
                 for line in response.content.splitlines():
-                    client.util.debug("| " + line.decode("utf8"), level=debug_level)
+                    msg += "| {}\n".format(line.decode("utf8"))
+
+            client.util.debug(msg, level=debug_level)
 
         # This check can help ensure that the SSL certificate wasn't accidently copied to another sensor.
         # We do this by verifying that the SSL cert matches the identity that the sensor believes it should be.
