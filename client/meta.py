@@ -100,13 +100,13 @@ def load(session, base_url, force=False, cache_file=None):
 
     cache_file (str): File where to load cached meta data from if it exists.
     """
-    (_, schema, cache, data) = session.retrieveResource(base_url, debug_level=2)
+    (response, schema, cache, data) = session.retrieveResource(base_url, debug_level=2)
 
     if schema != "index":
         if data and 'message' in data:
             client.util.fatalError(data['message'], base_url)
         else:
-            client.util.fatalError("URL not pointing to API base address", base_url)
+            client.util.fatalError("URL {} not pointing to API base address (use '-dd' to see full response)".format(base_url), "{} {}".format(response.status_code, response.reason))
 
     if cache_file and not force:
         cached_meta = Meta.load(cache_file)
