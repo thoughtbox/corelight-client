@@ -5,16 +5,42 @@
 import getpass
 import sys
 
+try:
+    from opentelemetry import trace
+    from opentelemetry.trace.status import Status, StatusCode
+except ModuleNotFoundError:
+    # If OpenTelemetry isn't installed, we'll silently go without
+    pass
+
+    # But we'll set trace to help later
+    trace = None
+
+if trace:
+    tracer = trace.get_tracer(__name__)
+else:
+    import contextlib
+
+    class TraceUtil:
+        def start_as_current_span(self, *args, **kwargs):
+            return contextlib.suppress()
+
+    tracer = TraceUtil()
+
 # Debug level. See ``enableDebug()`` for values.
 _DebugLevel = 0
 
 def fatalError(msg, arg=None):
     """Reports a fatal error and aborts the process."""
     if arg:
-        print("Fatal error: {} ({})".format(msg, arg), file=sys.stderr)
+        msg_formatted = "Fatal error: {} ({})".format(msg, arg)
     else:
-        print("Fatal error: {}".format(msg), file=sys.stderr)
+        msg_formatted = "Fatal error: {}".format(msg)
 
+    if trace:
+        trace.get_current_span().add_event("fatal error", attributes={ "msg": msg, "arg": arg })
+        trace.get_current_span().set_status(Status(StatusCode.ERROR, msg_formatted))
+
+    print(msg_formatted, file=sys.stderr)
     sys.exit(1)
 
 def error(msg, arg=None):
@@ -24,12 +50,18 @@ def error(msg, arg=None):
     else:
         print("Error: {}".format(msg), file=sys.stderr)
 
+    if trace:
+        trace.get_current_span().add_event("error", attributes={ "msg": msg, "arg": arg })
+
 def infoMessage(msg, arg=None):
     """Reports a notice to the user."""
     if arg:
         print("Note: {} ({})".format(msg, arg), file=sys.stderr)
     else:
         print("Note: {}".format(msg), file=sys.stderr)
+
+    if trace:
+        trace.get_current_span().add_event("info", attributes={ "msg": msg, "arg": arg })
 
 def enableDebug(level):
     """
@@ -54,6 +86,9 @@ def debug(msg, level=1):
     """
     if _DebugLevel >= level:
         print(msg, file=sys.stderr)
+
+    if trace:
+        trace.get_current_span().add_event("debug", attributes={ "msg": msg, "level": level })
 
 def appendUrl(baseUrl, appendedPath):
     """
