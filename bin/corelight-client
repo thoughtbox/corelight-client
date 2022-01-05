@@ -287,6 +287,24 @@ if trace and "OTEL_CONSOLE_SPAN_EXPORT" in os.environ:
     processor = BatchSpanProcessor(ConsoleSpanExporter())
     provider.add_span_processor(processor)
 
+if "OTEL_EXPORTER_OTLP_ENDPOINT" in os.environ:
+    # pylint: disable=ungrouped-imports
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+    trace.get_tracer_provider().add_span_processor(
+        BatchSpanProcessor(OTLPSpanExporter())
+    )
+
+if "OTEL_EXPORTER_JAEGER_ENDPOINT" in os.environ or "OTEL_EXPORTER_JAEGER_AGENT_HOST" in os.environ:
+    # pylint: disable=ungrouped-imports
+    from opentelemetry.exporter.jaeger.thrift import JaegerExporter
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+    trace.get_tracer_provider().add_span_processor(
+        BatchSpanProcessor(JaegerExporter())
+    )
+
 with tracer.start_as_current_span(name="root span"):
     with tracer.start_as_current_span(name="find auth method"):
         for i in range(len(auth_schemes_to_use)):
