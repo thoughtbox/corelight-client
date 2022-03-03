@@ -29,6 +29,19 @@ else:
 # Debug level. See ``enableDebug()`` for values.
 _DebugLevel = 0
 
+def trace_add_event(name, msg, arg=None, level=None, status=None):
+    if trace:
+        attributes = { "msg": str(msg) }
+        if arg:
+            attributes["arg"] = str(arg)
+        if level:
+            attributes["level"] = level
+
+        trace.get_current_span().add_event(name, attributes=attributes)
+
+        if status:
+            trace.get_current_span().set_status(status)
+
 def fatalError(msg, arg=None):
     """Reports a fatal error and aborts the process."""
     if arg:
@@ -36,9 +49,7 @@ def fatalError(msg, arg=None):
     else:
         msg_formatted = "Fatal error: {}".format(msg)
 
-    if trace:
-        trace.get_current_span().add_event("fatal error", attributes={ "msg": msg, "arg": arg })
-        trace.get_current_span().set_status(Status(StatusCode.ERROR, msg_formatted))
+    trace_add_event("fatal error", msg, arg, status=Status(StatusCode.ERROR, msg_formatted))
 
     print(msg_formatted, file=sys.stderr)
     sys.exit(1)
@@ -50,8 +61,7 @@ def error(msg, arg=None):
     else:
         print("Error: {}".format(msg), file=sys.stderr)
 
-    if trace:
-        trace.get_current_span().add_event("error", attributes={ "msg": msg, "arg": arg })
+    trace_add_event("error", msg, arg)
 
 def infoMessage(msg, arg=None):
     """Reports a notice to the user."""
@@ -60,8 +70,7 @@ def infoMessage(msg, arg=None):
     else:
         print("Note: {}".format(msg), file=sys.stderr)
 
-    if trace:
-        trace.get_current_span().add_event("info", attributes={ "msg": msg, "arg": arg })
+    trace_add_event("info", msg, arg)
 
 def enableDebug(level):
     """
@@ -87,8 +96,7 @@ def debug(msg, level=1):
     if _DebugLevel >= level:
         print(msg, file=sys.stderr)
 
-    if trace:
-        trace.get_current_span().add_event("debug", attributes={ "msg": msg, "level": level })
+    trace_add_event("debug", msg, level=level)
 
 def appendUrl(baseUrl, appendedPath):
     """
